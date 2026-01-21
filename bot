@@ -1,0 +1,293 @@
+import discord
+from discord.ext import commands
+from discord import app_commands, ui
+import sqlite3
+from datetime import datetime
+
+# =========================
+# CONFIG
+# =========================
+TOKEN = ""
+GUILD_ID = 123456789012345678
+ADMIN_IDS = [1298644219925106803]
+
+# =========================
+# BOT SETUP
+# =========================
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+ import os, sqlite3
+
+ if os.path.exists("shop.db"):
+    try:
+        sqlite3.connect("shop.db").execute("SELECT 1")
+    except sqlite3.DatabaseError:
+         os.remove("shop.db")
+
+
+# =========================
+# DATABASE
+# =========================
+db = sqlite3.connect("shop.db", check_same_thread=False)
+cur = db.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    balance INTEGER DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS services (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT,
+    name TEXT,
+    price INTEGER
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    service TEXT,
+    status TEXT,
+    reason TEXT,
+    created_at TEXT
+)
+""")
+db.commit()
+
+# =========================
+# DEFAULT SERVICES
+# =========================
+DEFAULT_SERVICES = [
+    ("Blox Fruits", "ฟาร์มเลเวล", 100),
+    ("Blox Fruits", "ฟาร์มเงิน Beli", 80),
+    ("Blox Fruits", "ฟาร์มหมัด / ดาบ", 120),
+    ("Blox Fruits", "ปลุกผล", 150),
+    ("Blox Fruits", "เหมาฟาร์ม", 300),
+]
+
+cur.execute("SELECT COUNT(*) FROM services")
+if cur.fetchone()[0] == 0:
+    cur.executemany(
+        "INSERT INTO services (category, name, price) VALUES (?, ?, ?)",
+        DEFAULT_SERVICES
+    )
+    db.commit()
+
+# =========================
+# HELPERS
+# =========================
+def get_balance(user_id):
+    if user_id in ADMIN_IDS:
+        return 999999999
+    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    db.commit()
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    return cur.fetchone()[0]
+
+def add_balance(user_id, amount):
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
+    db.commit()
+
+def create_order(user_id, service):
+    cur.execute(
+        "INSERT INTO orders (user_id, service, status, created_at) VALUES (?, ?, 'รอ', ?)",
+        (user_id, service, datetime.now().isoformat())
+    )
+    db.commit()
+
+# =========================
+# UI COMPONENTS
+# =========================
+class CategorySelect(ui.Select):
+    def __init__(self):
+        cur.execute("SELECT DISTINCT category FROM services")
+        categories = [c[0] for c in cur.fetchall()]
+
+        options = [
+            discord.SelectOption(label=c)
+            for c in categories
+        ]
+
+        super().__init__(
+            placeholder="📂 เลือกหมวดหมู่",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "🛒 เลือกบริการ",
+            view=ServiceView(self.values[0]),
+            ephemeral=True
+        )
+
+class ServiceSelect(ui.Select):
+    def __init__(self, category):
+        self.category = category
+        cur.execute(
+            "SELECT name, price FROM services WHERE category=?",
+            (category,)
+        )
+        options = [
+            discord.SelectOption(
+                label=name,
+                description=f"{price} บาท"
+            )
+            for name, price in cur.fetchall()
+        ]
+
+        super().__init__(
+            placeholder="เลือกบริการ",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        service = self.values[0]
+        cur.execute(
+            "SELECT price FROM services WHERE name=?",
+            (service,)
+        )
+        price = cur.fetchone()[0]
+
+        balance = get_balance(interaction.user.id)
+        if balance < price:
+            await interaction.response.send_message("❌ เงินไม่พอ", ephemeral=True)
+            return
+
+        if interaction.user.id not in ADMIN_IDS:
+            add_balance(interaction.user.id, -price)
+
+        create_order(interaction.user.id, service)
+
+        await interaction.response.send_message(
+            f"✅ สั่งซื้อสำเร็จ\nบริการ: **{service}**\n💰 เหลือ {get_balance(interaction.user.id)} บาท",
+            ephemeral=True
+        )
+
+class CategoryView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(CategorySelect())
+
+class ServiceView(ui.View):
+    def __init__(self, category):
+        super().__init__(timeout=180)
+        self.add_item(ServiceSelect(category))
+
+# =========================
+# ADMIN UI
+# =========================
+class StatusSelect(ui.Select):
+    def __init__(self, order_id):
+        self.order_id = order_id
+        options = [
+            discord.SelectOption(label="ทำ"),
+            discord.SelectOption(label="เสร็จ"),
+            discord.SelectOption(label="ไม่สำเร็จ"),
+        ]
+        super().__init__(placeholder="เปลี่ยนสถานะ", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        status = self.values[0]
+        cur.execute("UPDATE orders SET status=? WHERE id=?", (status, self.order_id))
+        db.commit()
+
+        if status == "ไม่สำเร็จ":
+            await interaction.response.send_message(
+                "เลือกเหตุผล",
+                view=FailReasonView(self.order_id),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message("✅ อัปเดตแล้ว", ephemeral=True)
+
+class FailReasonSelect(ui.Select):
+    def __init__(self, order_id):
+        self.order_id = order_id
+        options = [
+            discord.SelectOption(label="ลูกค้าไม่ตอบ"),
+            discord.SelectOption(label="ข้อมูลผิด"),
+            discord.SelectOption(label="ทำไม่ได้"),
+        ]
+        super().__init__(placeholder="เหตุผล", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        reason = self.values[0]
+        cur.execute(
+            "UPDATE orders SET reason=? WHERE id=?",
+            (reason, self.order_id)
+        )
+        db.commit()
+        await interaction.response.send_message("❌ บันทึกเหตุผลแล้ว", ephemeral=True)
+
+class AdminOrderView(ui.View):
+    def __init__(self, order_id):
+        super().__init__(timeout=None)
+        self.add_item(StatusSelect(order_id))
+
+class FailReasonView(ui.View):
+    def __init__(self, order_id):
+        super().__init__(timeout=None)
+        self.add_item(FailReasonSelect(order_id))
+
+# =========================
+# SLASH COMMANDS
+# =========================
+@bot.tree.command(name="menu", description="เมนูร้าน")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+async def menu(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🏪 SHOP",
+        description="เลือกหมวดหมู่ด้านล่าง",
+        color=0x2ecc71
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=CategoryView()
+    )
+
+@bot.tree.command(name="balance", description="เช็กเงิน")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+async def balance(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"💰 เงินคงเหลือ: {get_balance(interaction.user.id)} บาท",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="addmoney", description="แอดมินเพิ่มเงิน")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+async def addmoney(interaction: discord.Interaction, user: discord.User, amount: int):
+    if interaction.user.id not in ADMIN_IDS:
+        await interaction.response.send_message("❌ ไม่มีสิทธิ์", ephemeral=True)
+        return
+    add_balance(user.id, amount)
+    await interaction.response.send_message("✅ เพิ่มเงินแล้ว", ephemeral=True)
+
+@bot.tree.command(name="queue", description="ดูคิวทั้งหมด")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+async def queue(interaction: discord.Interaction):
+    if interaction.user.id not in ADMIN_IDS:
+        await interaction.response.send_message("❌ ไม่มีสิทธิ์", ephemeral=True)
+        return
+
+    cur.execute("SELECT id, service, status FROM orders ORDER BY id ASC")
+    rows = cur.fetchall()
+
+    msg = "\n".join([f"#{i} | {s} | {st}" for i, s, st in rows]) or "ไม่มีคิว"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+# =========================
+# READY
+# =========================
+@bot.event
+async def on_ready():
+    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    print(f"✅ Logged in as {bot.user}")
+
+bot.run(TOKEN)
