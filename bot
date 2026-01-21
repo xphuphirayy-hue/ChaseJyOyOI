@@ -7,7 +7,7 @@ from datetime import datetime
 # =========================
 # CONFIG
 # =========================
-TOKEN = ""
+TOKEN = "MTQ2MzQ5MDI0NjI4NDAyMTg1Mg.GnW7DD.4vyLACZrhOb2VXmzSAnS_roCo5SljleVLcbOLI"
 GUILD_ID = 123456789012345678
 ADMIN_IDS = [1298644219925106803]
 
